@@ -1,0 +1,899 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Household Expense Tracker (Cloud Sync)</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+        body { font-family: 'Inter', sans-serif; transition: background-color 0.3s, color 0.3s; }
+
+        /* Theme Styles: Soft, eye-soothing slate background for bright view (#e2e8f0) */
+        body.theme-bright {
+            background-color: #e2e8f0;
+            color: #1e293b;
+        }
+        body.theme-dark {
+            background-color: #0f172a;
+            color: #f1f5f9;
+        }
+        
+        /* Custom scrollbar for transaction detail list */
+        .custom-scrollbar::-webkit-scrollbar {
+            width: 6px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-track {
+            background: transparent;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+            background: rgba(156, 163, 175, 0.4);
+            border-radius: 9999px;
+        }
+    </style>
+<link rel="manifest" href="manifest.json">
+</head>
+<body class="theme-bright">
+    <div id="app" class="min-h-screen flex flex-col"></div>
+
+    <script>
+        const CATEGORIES = [
+            "Grocery", "Bills", "Sangu", "school Van", "Rent", "Medical", "Travel", "school Fees", "Misc(shopping)"
+        ];
+        const LIMITED_CATEGORIES = ["Grocery", "Bills", "Misc(shopping)"];
+        const USERS = ["AG", "CN"];
+
+        // Extended MONTHS list from Nov 2026 to Jan 2028 (15 months)
+        const MONTHS = [];
+        let y = 2026, m = 11;
+        for (let i = 0; i < 15; i++) {
+            const dateObj = new Date(y, m - 1, 1);
+            const monthName = dateObj.toLocaleString('default', { month: 'long' });
+            MONTHS.push({ id: `${y}-${m}`, name: `${monthName} ${y}`, year: y, month: m, index: i });
+            m++;
+            if (m > 12) { m = 1; y++; }
+        }
+
+        function formatDateLocal(date) {
+            const yyyy = date.getFullYear();
+            const mm = String(date.getMonth() + 1).padStart(2, '0');
+            const dd = String(date.getDate()).padStart(2, '0');
+            return `${yyyy}-${mm}-${dd}`;
+        }
+
+        let savedExpenses = {};
+        try {
+            savedExpenses = JSON.parse(localStorage.getItem('household_expenses_sync') || '{}');
+        } catch(e) {
+            savedExpenses = {};
+        }
+
+        let savedCustomAverages = {};
+        try {
+            savedCustomAverages = JSON.parse(localStorage.getItem('household_custom_averages') || '{}');
+        } catch(e) {
+            savedCustomAverages = {};
+        }
+
+        let initialTheme = localStorage.getItem('household_tracker_theme') || 'bright';
+        if (initialTheme !== 'dark' && initialTheme !== 'bright') {
+            initialTheme = 'bright';
+        }
+
+        let state = {
+            currentMonthId: MONTHS[0].id,
+            selectedDateStr: formatDateLocal(new Date()),
+            activeTab: 'daily',
+            expenses: savedExpenses,
+            customPriorAverages: savedCustomAverages,
+            theme: initialTheme,
+            isModalOpen: false,
+            isSyncModalOpen: false,
+            isEditAverageModalOpen: false,
+            modalDate: formatDateLocal(new Date()),
+            modalCategory: CATEGORIES[0],
+            modalUser: USERS[0],
+            modalAmount: '',
+            modalComment: '',
+            modalIsPersonal: false,
+            editAverageValue: '',
+            binId: localStorage.getItem('jsonbin_bin_id') || '',
+            masterKey: localStorage.getItem('jsonbin_master_key') || '',
+            isSyncing: false,
+            syncStatus: 'Local mode',
+            toastMessage: null
+        };
+
+        function saveLocal() {
+            try {
+                localStorage.setItem('household_expenses_sync', JSON.stringify(state.expenses));
+                localStorage.setItem('household_custom_averages', JSON.stringify(state.customPriorAverages));
+            } catch(e) {
+                showToast("Storage quota exceeded!");
+            }
+        }
+
+        function showToast(msg) {
+            state.toastMessage = msg;
+            render();
+            setTimeout(() => {
+                if (state.toastMessage === msg) {
+                    state.toastMessage = null;
+                    render();
+                }
+            }, 3500);
+        }
+
+        function toggleTheme() {
+            const newTheme = state.theme === 'dark' ? 'bright' : 'dark';
+            state.theme = newTheme;
+            localStorage.setItem('household_tracker_theme', newTheme);
+            document.body.className = `theme-${newTheme}`;
+            render();
+        }
+
+        async function syncWithCloud(push = false) {
+            if (!state.binId || !state.masterKey) return;
+
+            state.isSyncing = true;
+            state.syncStatus = 'Syncing...';
+            render();
+
+            try {
+                const url = `https://api.jsonbin.io/v3/b/${state.binId}`;
+                if (push) {
+                    const payload = {
+                        expenses: state.expenses,
+                        customPriorAverages: state.customPriorAverages
+                    };
+                    const res = await fetch(url, {
+                        method: 'PUT',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'X-Master-Key': state.masterKey
+                        },
+                        body: JSON.stringify(payload)
+                    });
+                    if (!res.ok) throw new Error('Failed to push');
+                    state.syncStatus = 'Synced ✓';
+                } else {
+                    const res = await fetch(url, {
+                        headers: { 'X-Master-Key': state.masterKey }
+                    });
+                    if (!res.ok) throw new Error('Failed to fetch');
+                    const data = await res.json();
+                    if (data && data.record) {
+                        if (data.record.expenses) {
+                            state.expenses = data.record.expenses;
+                            state.customPriorAverages = data.record.customPriorAverages || {};
+                        } else {
+                            state.expenses = data.record;
+                        }
+                        saveLocal();
+                    }
+                    state.syncStatus = 'Synced ✓';
+                }
+            } catch (err) {
+                console.error(err);
+                state.syncStatus = 'Sync failed ⚠️';
+            }
+            state.isSyncing = false;
+            render();
+        }
+
+        function getParentCategory(subCat) {
+            for (let cat of CATEGORIES) {
+                if (subCat === cat || subCat.startsWith(cat + " ")) {
+                    return cat;
+                }
+            }
+            return subCat;
+        }
+
+        // Calculate or return overridden Prior Monthly Average
+        function calculatePriorMonthlyAverage(currentMonthIndex, monthId) {
+            if (state.customPriorAverages[monthId] !== undefined && state.customPriorAverages[monthId] !== null) {
+                return parseFloat(state.customPriorAverages[monthId]);
+            }
+            if (currentMonthIndex === 0) return 0;
+            let priorTotal = 0;
+            let monthsWithDataCount = 0;
+
+            for (let i = 0; i < currentMonthIndex; i++) {
+                const mId = MONTHS[i].id;
+                const mExpenses = state.expenses[mId] || [];
+                const monthSum = mExpenses.reduce((sum, item) => sum + item.amount, 0);
+                if (monthSum > 0) {
+                    priorTotal += monthSum;
+                    monthsWithDataCount++;
+                }
+            }
+
+            if (monthsWithDataCount === 0) return 0;
+            return priorTotal / monthsWithDataCount;
+        }
+
+        function selectDate(dateStr) {
+            state.selectedDateStr = dateStr;
+            render();
+        }
+
+        function render() {
+            try {
+                const app = document.getElementById('app');
+                if (!app) return;
+
+                document.body.className = `theme-${state.theme}`;
+
+                const isDark = state.theme === 'dark';
+                const headerClass = isDark ? 'bg-slate-950' : 'bg-slate-900';
+
+                const cardBg = isDark ? 'bg-slate-800 border-slate-700 text-slate-100' : 'bg-slate-50 border-slate-300 text-slate-800';
+                const subText = isDark ? 'text-slate-400' : 'text-slate-500';
+
+                const currentMonthObj = MONTHS.find(mo => mo.id === state.currentMonthId) || MONTHS[0];
+                const currentMonthExpenses = state.expenses[state.currentMonthId] || [];
+
+                // Validate if selected date belongs to current month, else adjust default date
+                const [selY, selM] = state.selectedDateStr.split('-').map(Number);
+                if (selY !== currentMonthObj.year || selM !== currentMonthObj.month) {
+                    state.selectedDateStr = `${currentMonthObj.year}-${String(currentMonthObj.month).padStart(2, '0')}-01`;
+                }
+
+                // Daily expenses mapping
+                const dailyDataMap = {};
+                currentMonthExpenses.forEach(item => {
+                    if (!dailyDataMap[item.date]) {
+                        dailyDataMap[item.date] = { entries: [], total: 0 };
+                    }
+                    dailyDataMap[item.date].entries.push(item);
+                    dailyDataMap[item.date].total += item.amount;
+                });
+
+                // Calculate category totals
+                const categoryTotals = {};
+                CATEGORIES.forEach(cat => { categoryTotals[cat] = 0; });
+                currentMonthExpenses.forEach(item => {
+                    const parent = getParentCategory(item.category);
+                    if (categoryTotals[parent] !== undefined) {
+                        categoryTotals[parent] += item.amount;
+                    }
+                });
+                const totalMonthlySpend = Object.values(categoryTotals).reduce((a, b) => a + b, 0);
+                const priorAverage = calculatePriorMonthlyAverage(currentMonthObj.index, currentMonthObj.id);
+
+                // Build Calendar Grid details
+                const firstDayOfMonth = new Date(currentMonthObj.year, currentMonthObj.month - 1, 1);
+                const startingDayOfWeek = firstDayOfMonth.getDay(); // 0 = Sun
+                const daysInMonth = new Date(currentMonthObj.year, currentMonthObj.month, 0).getDate();
+
+                const calendarCells = [];
+                for (let i = 0; i < startingDayOfWeek; i++) {
+                    calendarCells.push({ isBlank: true });
+                }
+                for (let dayNum = 1; dayNum <= daysInMonth; dayNum++) {
+                    const dStr = `${currentMonthObj.year}-${String(currentMonthObj.month).padStart(2, '0')}-${String(dayNum).padStart(2, '0')}`;
+                    const dayData = dailyDataMap[dStr] || { entries: [], total: 0 };
+                    calendarCells.push({
+                        isBlank: false,
+                        dayNum,
+                        dateStr: dStr,
+                        total: dayData.total,
+                        count: dayData.entries.length
+                    });
+                }
+
+                // Selected Date details
+                const selectedDayData = dailyDataMap[state.selectedDateStr] || { entries: [], total: 0 };
+                const selectedDateObj = new Date(state.selectedDateStr + 'T00:00:00');
+                const formattedSelectedDate = selectedDateObj.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
+
+                app.innerHTML = `
+                    <!-- Toast Notification -->
+                    ${state.toastMessage ? `
+                        <div class="fixed top-16 left-1/2 transform -translate-x-1/2 z-50 bg-amber-600 text-white px-4 py-2 rounded-xl shadow-lg text-xs font-semibold animate-bounce">
+                            ⚠️ ${state.toastMessage}
+                        </div>
+                    ` : ''}
+
+                    <!-- Header -->
+                    <header class="${headerClass} text-white shadow-md sticky top-0 z-30 transition-colors">
+                        <div class="max-w-6xl mx-auto px-3 sm:px-4 py-2.5 sm:py-3 flex items-center justify-between gap-2">
+                            <div class="flex items-center space-x-2 shrink-0">
+                                <div class="bg-blue-600 p-1.5 sm:p-2 rounded-xl font-bold text-lg sm:text-xl shadow">💰</div>
+                                <div>
+                                    <h1 class="text-xs sm:text-lg font-bold leading-tight">Expense Tracker</h1>
+                                    <p class="text-[10px] sm:text-[11px] text-slate-300"><span class="text-blue-300 font-semibold">${state.syncStatus}</span></p>
+                                </div>
+                            </div>
+                            
+                            <!-- Header Controls in Single Row for Mobile -->
+                            <div class="flex items-center gap-1.5 sm:gap-2 shrink-0">
+                                <button onclick="syncWithCloud(false)" class="bg-blue-600 hover:bg-blue-700 text-xs text-white border border-blue-500 rounded-xl px-2.5 py-1.5 transition flex items-center justify-center shrink-0 font-semibold shadow" title="Fetch Latest Data">
+                                    🔄 Fetch
+                                </button>
+                                <button onclick="toggleTheme()" class="bg-slate-800 hover:bg-slate-700 text-xs border border-slate-700 rounded-xl px-2 py-1.5 transition flex items-center justify-center shrink-0" title="Toggle Mode">
+                                    ${isDark ? '🌙 Dark' : '☀️ Bright'}
+                                </button>
+                                <button onclick="openSyncModal()" class="bg-slate-800 hover:bg-slate-700 text-xs border border-slate-700 rounded-xl px-2 sm:px-3 py-1.5 transition flex items-center space-x-1 shrink-0">
+                                    <span>⚙️</span><span class="hidden sm:inline"> Sync</span>
+                                </button>
+                                <select id="monthSelect" class="bg-slate-800 text-white text-xs border border-slate-700 rounded-xl px-1.5 py-1.5 focus:outline-none cursor-pointer font-bold max-w-[120px] sm:max-w-none truncate">
+                                    ${MONTHS.map(mo => `<option value="${mo.id}" ${mo.id === state.currentMonthId ? 'selected' : ''}>${mo.name}</option>`).join('')}
+                                </select>
+                            </div>
+                        </div>
+
+                        <!-- Navigation Tabs -->
+                        <div class="max-w-6xl mx-auto px-3 sm:px-4 flex space-x-1 border-t border-white/10 text-xs sm:text-sm overflow-x-auto custom-scrollbar">
+                            <button onclick="switchTab('daily')" class="py-2.5 px-3 whitespace-nowrap font-medium border-b-2 transition-colors ${state.activeTab === 'daily' ? 'border-blue-400 text-blue-300 font-bold' : 'border-transparent text-slate-300 hover:text-white'}">📅 Calendar</button>
+                            <button onclick="switchTab('monthly')" class="py-2.5 px-3 whitespace-nowrap font-medium border-b-2 transition-colors ${state.activeTab === 'monthly' ? 'border-blue-400 text-blue-300 font-bold' : 'border-transparent text-slate-300 hover:text-white'}">📊 Breakdown</button>
+                            <button onclick="switchTab('personal')" class="py-2.5 px-3 whitespace-nowrap font-medium border-b-2 transition-colors ${state.activeTab === 'personal' ? 'border-blue-400 text-blue-300 font-bold' : 'border-transparent text-slate-300 hover:text-white'}">👤 Personal Contrib.</button>
+                            <button onclick="switchTab('dashboard')" class="py-2.5 px-3 whitespace-nowrap font-medium border-b-2 transition-colors ${state.activeTab === 'dashboard' ? 'border-blue-400 text-blue-300 font-bold' : 'border-transparent text-slate-300 hover:text-white'}">📈 Dashboard</button>
+                        </div>
+                    </header>
+
+                    <!-- Main Content Container -->
+                    <main class="max-w-6xl mx-auto px-2 sm:px-6 py-3 sm:py-6 flex-1 w-full pb-24">
+                        ${state.activeTab === 'daily' ? `
+                            <div class="grid grid-cols-1 lg:grid-cols-12 gap-4 sm:gap-5 items-start">
+                                
+                                <!-- LHS: Monthly Interactive Calendar -->
+                                <div class="lg:col-span-7 ${cardBg} p-3 sm:p-5 rounded-2xl shadow-sm border space-y-3">
+                                    <div class="flex justify-between items-center pb-2 border-b ${isDark ? 'border-slate-700' : 'border-slate-200'}">
+                                        <div>
+                                            <h2 class="text-base sm:text-lg font-bold">${currentMonthObj.name}</h2>
+                                            <p class="text-[11px] sm:text-xs ${subText}">Select date to inspect entries</p>
+                                        </div>
+                                        <div class="text-right bg-blue-500/10 dark:bg-blue-900/30 px-3 py-1 rounded-xl border border-blue-200 dark:border-blue-800">
+                                            <span class="text-[10px] ${subText} block uppercase font-bold tracking-wider">Day Total</span>
+                                            <span class="text-base sm:text-xl font-black text-blue-600 dark:text-blue-400">
+                                                ₹${selectedDayData.total.toLocaleString('en-IN', {minimumFractionDigits: 2})}
+                                            </span>
+                                        </div>
+                                    </div>
+
+                                    <!-- Weekday Headers -->
+                                    <div class="grid grid-cols-7 gap-1 text-center font-bold text-xs ${subText} py-0.5">
+                                        <div class="text-red-500">Sun</div>
+                                        <div>Mon</div>
+                                        <div>Tue</div>
+                                        <div>Wed</div>
+                                        <div>Thu</div>
+                                        <div>Fri</div>
+                                        <div class="text-blue-500">Sat</div>
+                                    </div>
+
+                                    <!-- Calendar Grid -->
+                                    <div class="grid grid-cols-7 gap-1 sm:gap-2">
+                                        ${calendarCells.map(cell => {
+                                            if (cell.isBlank) {
+                                                return `<div class="h-14 sm:h-20 rounded-xl ${isDark ? 'bg-slate-900/30' : 'bg-slate-200/40'} border border-transparent"></div>`;
+                                            }
+                                            const isSelected = cell.dateStr === state.selectedDateStr;
+                                            const hasExpenses = cell.total > 0;
+                                            
+                                            let cellBgClass = isDark ? 'bg-slate-800/80 hover:bg-slate-700/80 border-slate-700' : 'bg-white hover:bg-blue-50/80 border-slate-200';
+                                            if (isSelected) {
+                                                cellBgClass = isDark ? 'bg-blue-900/40 border-2 border-blue-400 text-blue-100 shadow-md' : 'bg-blue-100/80 border-2 border-blue-600 text-blue-950 shadow-md';
+                                            }
+
+                                            return `
+                                                <button onclick="selectDate('${cell.dateStr}')" 
+                                                    class="h-14 sm:h-20 p-1 sm:p-1.5 rounded-xl border flex flex-col justify-between text-left transition relative group ${cellBgClass}">
+                                                    <div class="flex justify-between items-start w-full">
+                                                        <span class="text-xs sm:text-sm font-bold ${isSelected ? 'text-blue-600 dark:text-blue-400 font-black' : ''}">${cell.dayNum}</span>
+                                                        ${cell.count > 0 ? `<span class="w-1.5 h-1.5 sm:w-2 sm:h-2 rounded-full bg-blue-500 inline-block"></span>` : ''}
+                                                    </div>
+                                                    
+                                                    <div class="w-full text-right mt-auto">
+                                                        ${hasExpenses ? `
+                                                            <div class="text-[9px] sm:text-xs font-extrabold text-blue-600 dark:text-blue-400 leading-tight truncate">
+                                                                ₹${cell.total >= 1000 ? (cell.total/1000).toFixed(1) + 'k' : cell.total.toLocaleString('en-IN', {maximumFractionDigits:0})}
+                                                            </div>
+                                                            <div class="hidden sm:block text-[9px] ${subText} leading-tight">${cell.count} ${cell.count === 1 ? 'item' : 'items'}</div>
+                                                        ` : `
+                                                            <div class="text-[10px] text-slate-300 dark:text-slate-600 font-normal">-</div>
+                                                        `}
+                                                    </div>
+                                                </button>
+                                            `;
+                                        }).join('')}
+                                    </div>
+                                </div>
+
+                                <!-- RHS: Selected Date Details & Transactions Section -->
+                                <div class="lg:col-span-5 ${cardBg} p-3.5 sm:p-5 rounded-2xl shadow-sm border space-y-3.5 lg:sticky lg:top-20">
+                                    <div class="flex justify-between items-center border-b ${isDark ? 'border-slate-700' : 'border-slate-200'} pb-2.5">
+                                        <div>
+                                            <span class="text-[10px] uppercase font-semibold tracking-wider ${subText}">Selected Date</span>
+                                            <h3 class="text-sm sm:text-lg font-bold">${formattedSelectedDate}</h3>
+                                        </div>
+                                        <div class="text-right">
+                                            <span class="text-[10px] ${subText} block">Daily Total</span>
+                                            <span class="text-base sm:text-xl font-black text-blue-600 dark:text-blue-400">
+                                                ₹${selectedDayData.total.toLocaleString('en-IN', {minimumFractionDigits: 2})}
+                                            </span>
+                                        </div>
+                                    </div>
+
+                                    <!-- Comment / Daily History List -->
+                                    <div class="space-y-2.5">
+                                        <div class="flex justify-between items-center">
+                                            <h4 class="text-xs font-bold uppercase tracking-wider ${subText}">Daily Log (${selectedDayData.entries.length})</h4>
+                                            <button onclick="openModal('${state.selectedDateStr}')" class="text-xs text-blue-600 dark:text-blue-400 hover:underline font-bold flex items-center gap-0.5">
+                                                <span>+ Add entry</span>
+                                            </button>
+                                        </div>
+
+                                        ${selectedDayData.entries.length === 0 ? `
+                                            <div class="text-center py-6 ${isDark ? 'bg-slate-900/40 border-slate-700' : 'bg-slate-100/60 border-slate-200'} rounded-xl border border-dashed p-3">
+                                                <p class="text-xl mb-1">📝</p>
+                                                <p class="text-xs font-medium ${subText}">No expenses logged for this date.</p>
+                                                <button onclick="openModal('${state.selectedDateStr}')" class="mt-2.5 text-xs bg-blue-600 hover:bg-blue-700 text-white font-medium px-3 py-1.5 rounded-lg shadow transition">
+                                                    Log Expense Now
+                                                </button>
+                                            </div>
+                                        ` : `
+                                            <div class="space-y-2 max-h-[360px] overflow-y-auto pr-1 custom-scrollbar">
+                                                ${selectedDayData.entries.map(item => `
+                                                    <div class="p-2.5 rounded-xl border ${isDark ? 'bg-slate-900/60 border-slate-700 hover:border-slate-600' : 'bg-white border-slate-200 hover:border-blue-300'} transition flex items-center justify-between gap-2 shadow-sm">
+                                                        <div class="space-y-1 min-w-0">
+                                                            <div class="flex items-center space-x-1.5 flex-wrap gap-y-1">
+                                                                <span class="font-bold text-xs sm:text-sm truncate">${item.category}</span>
+                                                                ${item.user ? `<span class="bg-blue-100 text-blue-800 dark:bg-blue-900/60 dark:text-blue-300 font-extrabold px-1.5 py-0.5 rounded text-[10px] border border-blue-200 dark:border-blue-700">${item.user}</span>` : ''}
+                                                                ${item.isPersonal ? `<span class="bg-purple-100 text-purple-800 dark:bg-purple-900/60 dark:text-purple-300 font-extrabold px-1.5 py-0.5 rounded text-[10px] border border-purple-300 dark:border-purple-700 flex items-center gap-0.5" title="Personal Account Expense">👤 Personal</span>` : ''}
+                                                            </div>
+                                                            ${item.comment ? `<p class="text-xs text-amber-800 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-900/40 px-2 py-0.5 rounded-md italic truncate">💬 ${item.comment}</p>` : `<p class="text-[11px] ${subText} italic">No comment added</p>`}
+                                                        </div>
+                                                        <div class="text-right flex items-center space-x-2 shrink-0">
+                                                            <div>
+                                                                <span class="text-xs sm:text-sm font-bold text-blue-600 dark:text-blue-400 block">₹${item.amount.toLocaleString('en-IN', {minimumFractionDigits: 2})}</span>
+                                                            </div>
+                                                            <button onclick="deleteExpense('${item.id}')" class="text-red-400 hover:text-red-600 p-1 hover:bg-red-50 dark:hover:bg-red-950/30 rounded transition" title="Delete entry">
+                                                                ✕
+                                                            </button>
+                                                        </div>
+                                                    </div>
+                                                `).join('')}
+                                            </div>
+                                        `}
+                                    </div>
+                                </div>
+                            </div>
+                        ` : ''}
+
+                        ${state.activeTab === 'monthly' ? `
+                            <div class="space-y-6">
+                                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                    <div class="${cardBg} p-6 rounded-2xl shadow-sm border flex justify-between items-center">
+                                        <div>
+                                            <h2 class="text-base font-bold">${currentMonthObj.name} Total</h2>
+                                            <p class="text-xs ${subText}">Current month spending</p>
+                                        </div>
+                                        <div class="text-right">
+                                            <div class="text-2xl font-bold text-blue-600 dark:text-blue-400">₹${totalMonthlySpend.toLocaleString('en-IN', {minimumFractionDigits: 2})}</div>
+                                        </div>
+                                    </div>
+
+                                    <div class="${cardBg} p-6 rounded-2xl shadow-sm border flex justify-between items-center">
+                                        <div>
+                                            <div class="flex items-center gap-2">
+                                                <h2 class="text-base font-bold">Prior Monthly Average</h2>
+                                                <button onclick="openEditAverageModal()" class="text-xs text-blue-600 dark:text-blue-400 hover:underline font-semibold bg-blue-50 dark:bg-blue-900/40 px-2 py-0.5 rounded border border-blue-200 dark:border-blue-800">✏️ Edit</button>
+                                            </div>
+                                            <p class="text-xs ${subText}">Avg spend of past months in tracking year ${state.customPriorAverages[currentMonthObj.id] !== undefined ? '(Custom)' : '(Auto)'}</p>
+                                        </div>
+                                        <div class="text-right">
+                                            <div class="text-2xl font-bold text-emerald-600 dark:text-emerald-400">₹${priorAverage.toLocaleString('en-IN', {minimumFractionDigits: 2})}</div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                                    ${CATEGORIES.map(cat => {
+                                        const amt = categoryTotals[cat] || 0;
+                                        const percentage = totalMonthlySpend > 0 ? (amt / totalMonthlySpend) * 100 : 0;
+                                        return `
+                                            <div class="${cardBg} p-4 rounded-2xl shadow-sm border space-y-2">
+                                                <div class="flex justify-between items-center">
+                                                    <span class="font-semibold text-sm">${cat}</span>
+                                                    <span class="font-bold">₹${amt.toLocaleString('en-IN', {minimumFractionDigits: 2})}</span>
+                                                </div>
+                                                <div class="w-full ${isDark ? 'bg-slate-700' : 'bg-slate-200'} h-2 rounded-full overflow-hidden">
+                                                    <div class="bg-blue-600 h-full rounded-full transition-all duration-500" style="width: ${Math.min(percentage, 100)}%"></div>
+                                                </div>
+                                                <div class="flex justify-between text-xs ${subText}">
+                                                    <span>${percentage.toFixed(1)}% of monthly spend</span>
+                                                </div>
+                                            </div>
+                                        `;
+                                    }).join('')}
+                                </div>
+                            </div>
+                        ` : ''}
+
+                        ${state.activeTab === 'personal' ? `
+                            <div class="space-y-6">
+                                <div class="${cardBg} p-5 sm:p-6 rounded-2xl shadow-sm border space-y-1">
+                                    <h2 class="text-base sm:text-lg font-bold">👤 Individual Monthly Personal Account Contributions</h2>
+                                    <p class="text-xs ${subText}">Total value of personal account expenses paid by each individual for every month (Nov 2026 – Jan 2028)</p>
+                                </div>
+
+                                <div class="${cardBg} rounded-2xl shadow-sm border overflow-hidden">
+                                    <div class="overflow-x-auto">
+                                        <table class="w-full text-left border-collapse text-xs sm:text-sm">
+                                            <thead>
+                                                <tr class="${isDark ? 'bg-slate-950 text-white' : 'bg-slate-900 text-white'}">
+                                                    <th class="py-3 px-4 font-bold sticky left-0 z-10 ${isDark ? 'bg-slate-950' : 'bg-slate-900'}">Month</th>
+                                                    ${USERS.map(u => `<th class="py-3 px-4 font-bold text-right">${u}'s Personal Expense</th>`).join('')}
+                                                    <th class="py-3 px-4 font-bold text-right bg-purple-900/60 text-purple-100">Combined Personal Total</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody class="divide-y ${isDark ? 'divide-slate-700' : 'divide-slate-200'}">
+                                                ${MONTHS.map(mo => {
+                                                    const mExpenses = state.expenses[mo.id] || [];
+                                                    const personalExpenses = mExpenses.filter(item => item.isPersonal);
+                                                    
+                                                    let combinedMonthPersonal = 0;
+                                                    const userTotals = {};
+                                                    USERS.forEach(u => {
+                                                        const userSum = personalExpenses
+                                                            .filter(item => item.user === u)
+                                                            .reduce((sum, item) => sum + item.amount, 0);
+                                                        userTotals[u] = userSum;
+                                                        combinedMonthPersonal += userSum;
+                                                    });
+
+                                                    const isCurrentSelectedMonth = mo.id === state.currentMonthId;
+
+                                                    return `
+                                                        <tr class="${isCurrentSelectedMonth ? (isDark ? 'bg-purple-950/30' : 'bg-purple-50') : (isDark ? 'hover:bg-slate-700/50' : 'hover:bg-slate-100/60')}">
+                                                            <td class="py-3 px-4 font-bold sticky left-0 z-10 ${isCurrentSelectedMonth ? (isDark ? 'bg-slate-900 text-purple-300' : 'bg-purple-50 text-purple-950') : (isDark ? 'bg-slate-800' : 'bg-slate-50')}">
+                                                                ${mo.name} ${isCurrentSelectedMonth ? '⭐' : ''}
+                                                            </td>
+                                                            ${USERS.map(u => `
+                                                                <td class="py-3 px-4 text-right font-semibold ${userTotals[u] > 0 ? 'text-purple-600 dark:text-purple-300' : subText}">
+                                                                    ${userTotals[u] > 0 ? '₹' + userTotals[u].toLocaleString('en-IN', {minimumFractionDigits: 2}) : '-'}
+                                                                </td>
+                                                            `).join('')}
+                                                            <td class="py-3 px-4 text-right font-black text-purple-700 dark:text-purple-300 bg-purple-500/10">
+                                                                ₹${combinedMonthPersonal.toLocaleString('en-IN', {minimumFractionDigits: 2})}
+                                                            </td>
+                                                        </tr>
+                                                    `;
+                                                }).join('')}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </div>
+                            </div>
+                        ` : ''}
+
+                        ${state.activeTab === 'dashboard' ? `
+                            <div class="space-y-6">
+                                <div class="${cardBg} p-6 rounded-2xl shadow-sm border">
+                                    <h2 class="text-lg font-bold">Annual Expense Dashboard</h2>
+                                    <p class="text-xs ${subText}">Overview of spending and month-wise totals across all 15 months (Nov 2026 – Jan 2028)</p>
+                                </div>
+
+                                <div class="${cardBg} rounded-2xl shadow-sm border overflow-hidden">
+                                    <div class="overflow-x-auto">
+                                        <table class="w-full text-left border-collapse text-xs">
+                                            <thead>
+                                                <tr class="${isDark ? 'bg-slate-950 text-white' : 'bg-slate-900 text-white'}">
+                                                    <th class="py-3 px-3 font-semibold sticky left-0 z-10 ${isDark ? 'bg-slate-950' : 'bg-slate-900'}">Category</th>
+                                                    ${MONTHS.map(mo => `<th class="py-3 px-2 font-semibold text-right">${mo.name.split(' ')[0]} '${mo.year.toString().slice(-2)}</th>`).join('')}
+                                                    <th class="py-3 px-3 font-semibold text-right bg-slate-800">Total</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody class="divide-y ${isDark ? 'divide-slate-700' : 'divide-slate-200'}">
+                                                ${CATEGORIES.map(cat => {
+                                                    let catYearTotal = 0;
+                                                    return `
+                                                        <tr class="${isDark ? 'hover:bg-slate-700/50' : 'hover:bg-blue-50/50'}">
+                                                            <td class="py-3 px-3 font-bold sticky left-0 z-10 ${isDark ? 'bg-slate-800' : 'bg-slate-50'}">${cat}</td>
+                                                            ${MONTHS.map(mo => {
+                                                                const monthItems = state.expenses[mo.id] || [];
+                                                                const mTotal = monthItems
+                                                                    .filter(item => getParentCategory(item.category) === cat)
+                                                                    .reduce((sum, item) => sum + item.amount, 0);
+                                                                catYearTotal += mTotal;
+                                                                return `<td class="py-3 px-2 text-right ${subText}">${mTotal > 0 ? '₹' + mTotal.toLocaleString('en-IN', {maximumFractionDigits: 0}) : '-'}</td>`;
+                                                            }).join('')}
+                                                            <td class="py-3 px-3 text-right font-bold text-blue-600 dark:text-blue-400 bg-blue-500/10">₹${catYearTotal.toLocaleString('en-IN', {maximumFractionDigits: 0})}</td>
+                                                        </tr>
+                                                    `;
+                                                }).join('')}
+                                                
+                                                <!-- Overall Monthly Total Row -->
+                                                <tr class="${isDark ? 'bg-slate-900 font-bold border-t-2 border-slate-700' : 'bg-slate-200 font-bold border-t-2 border-slate-300'}">
+                                                    <td class="py-3 px-3 uppercase sticky left-0 z-10 ${isDark ? 'bg-slate-900' : 'bg-slate-200'}">Overall Monthly Total</td>
+                                                    ${MONTHS.map(mo => {
+                                                        const monthItems = state.expenses[mo.id] || [];
+                                                        const monthTotal = monthItems.reduce((sum, item) => sum + item.amount, 0);
+                                                        return `<td class="py-3 px-2 text-right">${monthTotal > 0 ? '₹' + monthTotal.toLocaleString('en-IN', {maximumFractionDigits: 0}) : '-'}</td>`;
+                                                    }).join('')}
+                                                    <td class="py-3 px-3 text-right text-blue-600 dark:text-blue-400 bg-blue-500/20">
+                                                        ₹${MONTHS.reduce((grandSum, mo) => {
+                                                            const monthItems = state.expenses[mo.id] || [];
+                                                            return grandSum + monthItems.reduce((sum, item) => sum + item.amount, 0);
+                                                        }, 0).toLocaleString('en-IN', {maximumFractionDigits: 0})}
+                                                    </td>
+                                                </tr>
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </div>
+                            </div>
+                        ` : ''}
+                    </main>
+
+                    <!-- Quick Add FAB Button -->
+                    <div class="fixed bottom-6 right-6 z-40">
+                        <button onclick="openModal('${state.selectedDateStr}')" class="bg-blue-600 hover:bg-blue-700 text-white w-14 h-14 rounded-full shadow-xl flex items-center justify-center text-3xl font-light transition transform hover:scale-105 active:scale-95">+</button>
+                    </div>
+
+                    <!-- Add Expense Modal -->
+                    ${state.isModalOpen ? `
+                        <div class="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4" onclick="closeModal()">
+                            <div class="${cardBg} rounded-2xl max-w-md w-full p-6 shadow-2xl space-y-4" onclick="event.stopPropagation()">
+                                <div class="flex justify-between items-center border-b ${isDark ? 'border-slate-700' : 'border-slate-200'} pb-3">
+                                    <h3 class="font-bold text-lg">Add New Expense</h3>
+                                    <button type="button" onclick="closeModal()" class="text-slate-400 hover:text-slate-600 font-bold text-lg">✕</button>
+                                </div>
+                                <form onsubmit="handleSubmit(event)" class="space-y-4">
+                                    <div>
+                                        <label class="block text-xs font-semibold ${subText} mb-1">Date</label>
+                                        <input type="date" id="modalDateInput" value="${state.modalDate}" oninput="state.modalDate=this.value" class="w-full border ${isDark ? 'border-slate-700 bg-slate-900 text-slate-100' : 'border-slate-300 bg-white text-slate-800'} rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" required />
+                                    </div>
+                                    <div class="grid grid-cols-2 gap-3">
+                                        <div>
+                                            <label class="block text-xs font-semibold ${subText} mb-1">Expense Category</label>
+                                            <select id="modalCategoryInput" onchange="state.modalCategory=this.value" class="w-full border ${isDark ? 'border-slate-700 bg-slate-900 text-slate-100' : 'border-slate-300 bg-white text-slate-800'} rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+                                                ${CATEGORIES.map(cat => `<option value="${cat}" ${cat === state.modalCategory ? 'selected' : ''}>${cat}</option>`).join('')}
+                                            </select>
+                                        </div>
+                                        <div>
+                                            <label class="block text-xs font-semibold ${subText} mb-1">Added By (Member)</label>
+                                            <select id="modalUserInput" onchange="state.modalUser=this.value" class="w-full border ${isDark ? 'border-slate-700 bg-slate-900 text-slate-100' : 'border-slate-300 bg-white text-slate-800'} rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+                                                ${USERS.map(u => `<option value="${u}" ${u === state.modalUser ? 'selected' : ''}>${u}</option>`).join('')}
+                                            </select>
+                                        </div>
+                                    </div>
+                                    <div>
+                                        <label class="block text-xs font-semibold ${subText} mb-1">Amount (₹)</label>
+                                        <input type="number" step="0.01" id="modalAmountInput" placeholder="e.g. 450.00" value="${state.modalAmount}" oninput="state.modalAmount=this.value" class="w-full border ${isDark ? 'border-slate-700 bg-slate-900 text-slate-100' : 'border-slate-300 bg-white text-slate-800'} rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" required autofocus />
+                                    </div>
+                                    <div>
+                                        <label class="block text-xs font-semibold ${subText} mb-1">Comment / Note (Optional)</label>
+                                        <input type="text" id="modalCommentInput" placeholder="e.g. Milk & Veggies or Electric Bill" value="${state.modalComment}" oninput="state.modalComment=this.value" class="w-full border ${isDark ? 'border-slate-700 bg-slate-900 text-slate-100' : 'border-slate-300 bg-white text-slate-800'} rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                                    </div>
+
+                                    <div class="pt-1">
+                                        <label class="flex items-center space-x-2.5 cursor-pointer bg-purple-50 dark:bg-purple-950/40 p-3 rounded-xl border border-purple-200 dark:border-purple-900/60">
+                                            <input type="checkbox" id="modalIsPersonalInput" ${state.modalIsPersonal ? 'checked' : ''} onchange="state.modalIsPersonal=this.checked" class="w-4 h-4 text-purple-600 rounded focus:ring-purple-500 border-gray-300 cursor-pointer" />
+                                            <span class="text-xs font-bold text-purple-900 dark:text-purple-200">Paid from Personal Account</span>
+                                        </label>
+                                    </div>
+
+                                    <div class="flex space-x-3 pt-2">
+                                        <button type="button" onclick="closeModal()" class="flex-1 bg-slate-200 hover:bg-slate-300 text-slate-800 font-medium py-2.5 rounded-xl text-sm transition">Cancel</button>
+                                        <button type="submit" class="flex-1 bg-blue-600 hover:bg-blue-700 text-white font-medium py-2.5 rounded-xl text-sm shadow transition">Save Expense</button>
+                                    </div>
+                                </form>
+                            </div>
+                        </div>
+                    ` : ''}
+
+                    <!-- Edit Prior Monthly Average Modal -->
+                    ${state.isEditAverageModalOpen ? `
+                        <div class="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4" onclick="closeEditAverageModal()">
+                            <div class="${cardBg} rounded-2xl max-w-md w-full p-6 shadow-2xl space-y-4" onclick="event.stopPropagation()">
+                                <div class="flex justify-between items-center border-b ${isDark ? 'border-slate-700' : 'border-slate-200'} pb-3">
+                                    <h3 class="font-bold text-lg">✏️ Edit Prior Monthly Average</h3>
+                                    <button type="button" onclick="closeEditAverageModal()" class="text-slate-400 hover:text-slate-600 font-bold text-lg">✕</button>
+                                </div>
+                                <p class="text-xs ${subText}">Set a custom prior monthly average amount for <strong>${currentMonthObj.name}</strong>.</p>
+                                
+                                <form onsubmit="handleSaveCustomAverage(event)" class="space-y-4">
+                                    <div>
+                                        <label class="block text-xs font-semibold ${subText} mb-1">Custom Prior Monthly Average (₹)</label>
+                                        <input type="number" step="0.01" id="editAverageInput" placeholder="e.g. 25000" value="${state.editAverageValue}" oninput="state.editAverageValue=this.value" class="w-full border ${isDark ? 'border-slate-700 bg-slate-900 text-slate-100' : 'border-slate-300 bg-white text-slate-800'} rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" required autofocus />
+                                    </div>
+                                    <div class="flex space-x-2 pt-2">
+                                        <button type="button" onclick="resetCustomAverage()" class="bg-amber-100 hover:bg-amber-200 text-amber-900 dark:bg-amber-900/60 dark:text-amber-200 text-xs font-bold px-3 py-2 rounded-xl transition">Reset Auto</button>
+                                        <button type="button" onclick="closeEditAverageModal()" class="flex-1 bg-slate-200 hover:bg-slate-300 text-slate-800 font-medium py-2 rounded-xl text-xs transition">Cancel</button>
+                                        <button type="submit" class="flex-1 bg-blue-600 hover:bg-blue-700 text-white font-medium py-2 rounded-xl text-xs shadow transition">Save Average</button>
+                                    </div>
+                                </form>
+                            </div>
+                        </div>
+                    ` : ''}
+
+                    <!-- Sync Settings Modal -->
+                    ${state.isSyncModalOpen ? `
+                        <div class="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4" onclick="closeSyncModal()">
+                            <div class="${cardBg} rounded-2xl max-w-md w-full p-6 shadow-2xl space-y-4" onclick="event.stopPropagation()">
+                                <div class="flex justify-between items-center border-b ${isDark ? 'border-slate-700' : 'border-slate-200'} pb-3">
+                                    <h3 class="font-bold text-lg">⚙️ Cloud Sync Settings</h3>
+                                    <button type="button" onclick="closeSyncModal()" class="text-slate-400 hover:text-slate-600 font-bold text-lg">✕</button>
+                                </div>
+                                <p class="text-xs ${subText}">Connect both devices to the same JSONBin database to sync expenses live.</p>
+
+                                <form onsubmit="handleSaveSync(event)" class="space-y-4 border-t pt-3 ${isDark ? 'border-slate-700' : 'border-slate-200'}">
+                                    <div>
+                                        <label class="block text-xs font-semibold ${subText} mb-1">Bin ID</label>
+                                        <input type="text" id="binIdInput" placeholder="e.g. 65f...abc" value="${state.binId}" class="w-full border ${isDark ? 'border-slate-700 bg-slate-900 text-slate-100' : 'border-slate-300 bg-white text-slate-800'} rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" required />
+                                    </div>
+                                    <div>
+                                        <label class="block text-xs font-semibold ${subText} mb-1">Master Key (X-Master-Key)</label>
+                                        <input type="password" id="masterKeyInput" placeholder="e.g. $2a$10$..." value="${state.masterKey}" class="w-full border ${isDark ? 'border-slate-700 bg-slate-900 text-slate-100' : 'border-slate-300 bg-white text-slate-800'} rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" required />
+                                    </div>
+                                    <div class="flex space-x-3 pt-2">
+                                        <button type="button" onclick="closeSyncModal()" class="flex-1 bg-slate-200 hover:bg-slate-300 text-slate-800 font-medium py-2.5 rounded-xl text-sm transition">Cancel</button>
+                                        <button type="submit" class="flex-1 bg-blue-600 hover:bg-blue-700 text-white font-medium py-2.5 rounded-xl text-sm shadow transition">Save & Sync</button>
+                                    </div>
+                                </form>
+                            </div>
+                        </div>
+                    ` : ''}
+                `;
+
+                const monthSelect = document.getElementById('monthSelect');
+                if (monthSelect) {
+                    monthSelect.onchange = (e) => {
+                        state.currentMonthId = e.target.value;
+                        const [moY, moM] = e.target.value.split('-').map(Number);
+                        state.selectedDateStr = `${moY}-${String(moM).padStart(2, '0')}-01`;
+                        render();
+                    };
+                }
+            } catch (err) {
+                console.error("Render error:", err);
+            }
+        }
+
+        function switchTab(tab) {
+            state.activeTab = tab;
+            render();
+        }
+
+        function openModal(targetDateStr) {
+            state.modalDate = targetDateStr || state.selectedDateStr || formatDateLocal(new Date());
+            state.modalCategory = CATEGORIES[0];
+            state.modalUser = USERS[0];
+            state.modalAmount = '';
+            state.modalComment = '';
+            state.modalIsPersonal = false;
+            state.isModalOpen = true;
+            render();
+        }
+
+        function closeModal() {
+            state.isModalOpen = false;
+            render();
+        }
+
+        function openSyncModal() {
+            state.isSyncModalOpen = true;
+            render();
+        }
+
+        function closeSyncModal() {
+            state.isSyncModalOpen = false;
+            render();
+        }
+
+        function openEditAverageModal() {
+            const currentMonthObj = MONTHS.find(mo => mo.id === state.currentMonthId) || MONTHS[0];
+            const currentVal = calculatePriorMonthlyAverage(currentMonthObj.index, currentMonthObj.id);
+            state.editAverageValue = currentVal || '';
+            state.isEditAverageModalOpen = true;
+            render();
+        }
+
+        function closeEditAverageModal() {
+            state.isEditAverageModalOpen = false;
+            render();
+        }
+
+        async function handleSaveCustomAverage(e) {
+            e.preventDefault();
+            const val = parseFloat(state.editAverageValue);
+            if (!isNaN(val) && val >= 0) {
+                state.customPriorAverages[state.currentMonthId] = val;
+                saveLocal();
+                state.isEditAverageModalOpen = false;
+                render();
+                await syncWithCloud(true);
+            }
+        }
+
+        async function resetCustomAverage() {
+            delete state.customPriorAverages[state.currentMonthId];
+            saveLocal();
+            state.isEditAverageModalOpen = false;
+            render();
+            await syncWithCloud(true);
+        }
+
+        async function handleSaveSync(e) {
+            e.preventDefault();
+            state.binId = document.getElementById('binIdInput').value.trim();
+            state.masterKey = document.getElementById('masterKeyInput').value.trim();
+            localStorage.setItem('jsonbin_bin_id', state.binId);
+            localStorage.setItem('jsonbin_master_key', state.masterKey);
+            state.isSyncModalOpen = false;
+            await syncWithCloud(false);
+        }
+
+        async function deleteExpense(id) {
+            const list = state.expenses[state.currentMonthId] || [];
+            state.expenses[state.currentMonthId] = list.filter(item => item.id !== id);
+            saveLocal();
+            await syncWithCloud(true);
+            render();
+        }
+
+        async function handleSubmit(e) {
+            e.preventDefault();
+            const dateVal = document.getElementById('modalDateInput').value;
+            const catVal = document.getElementById('modalCategoryInput').value;
+            const userVal = document.getElementById('modalUserInput').value;
+            const amtVal = document.getElementById('modalAmountInput').value;
+            const commentVal = document.getElementById('modalCommentInput').value.trim();
+            const isPersonalVal = document.getElementById('modalIsPersonalInput') ? document.getElementById('modalIsPersonalInput').checked : false;
+
+            if (!amtVal || isNaN(amtVal)) return;
+
+            const [mYear, mMonth] = dateVal.split('-');
+            const targetMonthId = `${mYear}-${parseInt(mMonth, 10)}`;
+
+            if (LIMITED_CATEGORIES.includes(catVal)) {
+                const existingMonthExpenses = state.expenses[targetMonthId] || [];
+                const countOnDate = existingMonthExpenses.filter(item => item.date === dateVal && item.category === catVal).length;
+                if (countOnDate >= 5) {
+                    showToast(`Maximum limit of 5 entries per day reached for "${catVal}".`);
+                    return;
+                }
+            }
+
+            const newEntry = {
+                id: Date.now().toString() + Math.random().toString(36).substring(2, 5),
+                date: dateVal,
+                category: catVal,
+                user: userVal,
+                amount: parseFloat(amtVal),
+                comment: commentVal,
+                isPersonal: isPersonalVal
+            };
+
+            if (!state.expenses[targetMonthId]) {
+                state.expenses[targetMonthId] = [];
+            }
+            state.expenses[targetMonthId].unshift(newEntry);
+            saveLocal();
+            
+            state.selectedDateStr = dateVal;
+            state.currentMonthId = targetMonthId;
+            state.isModalOpen = false;
+            state.modalAmount = '';
+            state.modalComment = '';
+            state.modalIsPersonal = false;
+            
+            render();
+            await syncWithCloud(true);
+        }
+
+        if (state.binId && state.masterKey) {
+            syncWithCloud(false);
+        }
+
+        window.onload = function() {
+            render();
+        };
+    </script>
+</body>
+</html>
